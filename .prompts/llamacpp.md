@@ -7,14 +7,23 @@ This prompt has two outcomes:
 
 ## Upgrade range
 
-- Treat the `defaultVersion` change in `sdk/tools/libs/libs.go` as the proposed llama.cpp upgrade. Compare its previous committed value with the new value.
-- If yzma was also changed, compare the previous and proposed versions in every Go module.
+- Upgrade llama.cpp to the latest completed release published at `https://github.com/hybridgroup/llama-cpp-builder/releases` at the time this prompt is run. Compare the currently committed `defaultVersion` in `sdk/tools/libs/libs.go` with that release and update its authenticated manifest digest only if the routine-upgrade path applies.
+- Upgrade yzma to the latest commit on the upstream `hybridgroup/yzma` `main` branch at the time this prompt is run. Always use the head of `main`, not the latest tag or the version currently selected by a Go module. Compare every Go module's currently committed yzma version with that commit and keep all modules aligned if the routine-upgrade path applies.
 - Resolve build numbers, tags, pseudo-versions, and commits to exact upstream SHAs.
 - Verify the proposed llama.cpp build has a completed release in `hybridgroup/llama-cpp-builder`. Do not recommend a build Kronk cannot download.
 
 ## Review
 
 Use authoritative llama.cpp and yzma source, history, release notes, tests, and documentation. Inspect Kronk's actual usage before deciding that a change applies.
+
+Audit the complete upstream commit range, commit by commit; do not sample commits or rely only on release summaries. Review every llama.cpp commit between the exact old and proposed revisions against Kronk's actual llama, MTMD, speculative decoding/MTP, batching, cache, sampler, tokenizer, grammar and tool-calling, model-loading, multimodal, and backend usage. If yzma changes, perform the same commit-by-commit audit for its exact old-to-proposed range. For each commit, inspect the source diff and classify it as:
+
+- an internal fix or optimization Kronk inherits automatically;
+- an API, ABI, behavioral-contract, model-support, or packaging change that requires Kronk or yzma work;
+- a new capability or better API that Kronk could reasonably adopt; or
+- unrelated to Kronk.
+
+Account for every commit in the report. Commits with no Kronk impact may be grouped, but material changes and opportunities must be discussed individually with supporting evidence. Complete this audit before changing any files. The review itself is read-only; only proceed to implementation afterward when the routine-upgrade path applies.
 
 Determine:
 
