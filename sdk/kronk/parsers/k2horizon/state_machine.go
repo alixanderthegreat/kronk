@@ -34,11 +34,27 @@ var endOfTurn = []string{"<|ifm|im_end|>", "<|ifm|endoftext|>"}
 // Every marker it recognizes is a single vocabulary token, so matching is
 // exact per decoded piece. Inside a tool-call block every piece, markers
 // included, is routed to the tool channel so parseK2 sees the whole block.
+//
+// Reasoning text is held back until the state machine knows what it is.
+// The chat template opens a reasoning tag in every prompt, but the model
+// does not always use it: after a tool result it often answers directly and
+// ends the turn without ever closing the tag. Like IFM's own k2_horizon
+// parser, text in a reasoning block that is never closed and never followed
+// by a tool block is the answer. So held text is released as reasoning when
+// a closer or a tool block arrives, and as the answer when the model ends
+// its turn. If generation stops without the model ending its turn (e.g.
+// max_tokens), it stays reasoning: a cut-off thought is not a reply.
 type stateMachine struct {
 	status model.Channel
 
+	held         strings.Builder
+	sawEndOfTurn bool
+
 	inToolBlock bool
 	toolBuf     strings.Builder
+	// pendingTool is tool-block text not yet returned on the tool channel,
+	// because the piece that produced it returned held reasoning instead.
+	pendingTool string
 
 	toolCallDeltas []model.ResponseToolCallDelta
 	startedCalls   []model.ResponseToolCallDelta
@@ -48,8 +64,11 @@ type stateMachine struct {
 // request.
 func (sm *stateMachine) Reset() {
 	sm.status = model.ChannelAnswer
+	sm.held.Reset()
+	sm.sawEndOfTurn = false
 	sm.inToolBlock = false
 	sm.toolBuf.Reset()
+	sm.pendingTool = ""
 	sm.toolCallDeltas = nil
 	sm.startedCalls = nil
 }
@@ -60,19 +79,23 @@ func (sm *stateMachine) Reset() {
 // eog=true. Reset must be invoked between requests.
 func (sm *stateMachine) Classify(content string) (model.Result, bool) {
 	if isOneOf(content, endOfTurn) {
+		sm.sawEndOfTurn = true
 		return model.Result{}, true
 	}
 
 	if sm.inToolBlock {
+		pending := sm.pendingTool
+		sm.pendingTool = ""
+
 		if content == toolCallsClose {
 			sm.inToolBlock = false
 			sm.status = model.ChannelAnswer
-			return model.Result{Channel: model.ChannelTool}, false
+			return model.Result{Channel: model.ChannelTool, Content: pending}, false
 		}
 
 		sm.toolBuf.WriteString(content)
 		sm.updateToolCallDeltas()
-		return model.Result{Channel: model.ChannelTool, Content: content}, false
+		return model.Result{Channel: model.ChannelTool, Content: pending + content}, false
 	}
 
 	switch {
@@ -82,19 +105,64 @@ func (sm *stateMachine) Classify(content string) (model.Result, bool) {
 
 	case isOneOf(content, reasoningClosers):
 		sm.status = model.ChannelAnswer
+		return sm.releaseHeld(model.ChannelReasoning), false
+
+	case content == toolCallsOpen, content == toolCallOpen:
+		// A tool block ends reasoning just as a closer does. A bare
+		// <ifm|tool_call> is a call without the enclosing wrapper.
+		held := sm.releaseHeld(model.ChannelReasoning)
+		opener := ""
+		if content == toolCallOpen {
+			opener = content
+		}
+		sm.startToolBlock(opener)
+		if held.Content != "" {
+			// One result per piece: the held reasoning goes out now and the
+			// opener rides along with the next tool-channel result.
+			sm.pendingTool = opener
+			return held, false
+		}
+		return model.Result{Channel: model.ChannelTool, Content: opener}, false
+	}
+
+	if sm.status == model.ChannelReasoning {
+		sm.held.WriteString(content)
 		return model.Result{}, false
-
-	case content == toolCallsOpen:
-		sm.startToolBlock("")
-		return model.Result{Channel: model.ChannelTool}, false
-
-	case content == toolCallOpen:
-		// A call without the enclosing <ifm|tool_calls> wrapper.
-		sm.startToolBlock(content)
-		return model.Result{Channel: model.ChannelTool, Content: content}, false
 	}
 
 	return model.Result{Channel: sm.status, Content: content}, false
+}
+
+// releaseHeld drains held reasoning text on the given channel.
+func (sm *stateMachine) releaseHeld(channel model.Channel) model.Result {
+	if sm.held.Len() == 0 {
+		return model.Result{}
+	}
+	content := sm.held.String()
+	sm.held.Reset()
+	return model.Result{Channel: channel, Content: content}
+}
+
+// ConsumeVocabEOG records that the model ended its turn when the vocabulary
+// itself classifies the end-of-turn token as end-of-generation, so Classify
+// never sees it.
+func (sm *stateMachine) ConsumeVocabEOG(string) {
+	sm.sawEndOfTurn = true
+}
+
+// Flush releases reasoning text still held at end of generation: as the
+// answer if the model ended its turn without closing the reasoning block,
+// otherwise (generation was cut short) as reasoning.
+func (sm *stateMachine) Flush() model.Result {
+	if sm.pendingTool != "" {
+		pending := sm.pendingTool
+		sm.pendingTool = ""
+		return model.Result{Channel: model.ChannelTool, Content: pending}
+	}
+	if sm.sawEndOfTurn {
+		return sm.releaseHeld(model.ChannelAnswer)
+	}
+	return sm.releaseHeld(model.ChannelReasoning)
 }
 
 func (sm *stateMachine) startToolBlock(content string) {

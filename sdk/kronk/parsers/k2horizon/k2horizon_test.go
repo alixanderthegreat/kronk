@@ -50,6 +50,11 @@ func toolBuffer(t *testing.T, tokens []string) (string, *stateMachine) {
 			buf.WriteString(got.Content)
 		}
 	}
+	for got := sm.Flush(); got != (model.Result{}); got = sm.Flush() {
+		if got.Channel == model.ChannelTool {
+			buf.WriteString(got.Content)
+		}
+	}
 	return buf.String(), sm
 }
 
@@ -99,9 +104,10 @@ func TestStateMachine_ReasoningPrimedByPrompt(t *testing.T) {
 			// The chat template leaves the opener at the end of the prompt;
 			// the batch engine feeds it in before generation starts.
 			{effort.open, model.ChannelNone, "", false},
-			{"The user", model.ChannelReasoning, "The user", false},
-			{" wants pong.", model.ChannelReasoning, " wants pong.", false},
-			{effort.close, model.ChannelNone, "", false},
+			// Reasoning is held until the closer decides what it was.
+			{"The user", model.ChannelNone, "", false},
+			{" wants pong.", model.ChannelNone, "", false},
+			{effort.close, model.ChannelReasoning, "The user wants pong.", false},
 			{"\n", model.ChannelAnswer, "\n", false},
 			{"pong", model.ChannelAnswer, "pong", false},
 			{"<|ifm|im_end|>", model.ChannelNone, "", true},
@@ -329,6 +335,75 @@ func TestAdjustParams_ReasoningEffort(t *testing.T) {
 		if got.ReasoningEffort != tt.wantEffort || got.Thinking != tt.wantThinking {
 			t.Errorf("AdjustParams(%q) = effort %q thinking %q; want %q, %q",
 				tt.in, got.ReasoningEffort, got.Thinking, tt.wantEffort, tt.wantThinking)
+		}
+	}
+}
+
+// =============================================================================
+// Unclosed reasoning
+// =============================================================================
+
+// drain runs tokens and the end-of-generation Flush, returning what each
+// channel accumulated.
+func drain(t *testing.T, tokens []string) map[model.Channel]string {
+	t.Helper()
+	sm := Parser{}.NewStateMachine().(*stateMachine)
+	out := map[model.Channel]string{}
+	for _, token := range tokens {
+		got, eog := sm.Classify(token)
+		out[got.Channel] += got.Content
+		if eog {
+			break
+		}
+	}
+	for got := sm.Flush(); got != (model.Result{}); got = sm.Flush() {
+		out[got.Channel] += got.Content
+	}
+	return out
+}
+
+func TestUnclosedReasoning_EndOfTurnIsAnswer(t *testing.T) {
+	// After a tool result the model often answers without closing the
+	// reasoning block the template opened.
+	out := drain(t, []string{"<ifm|think>", "Sunny,", " 24C.", "<|ifm|im_end|>"})
+	if out[model.ChannelAnswer] != "Sunny, 24C." || out[model.ChannelReasoning] != "" {
+		t.Errorf("channels = %#v", out)
+	}
+}
+
+func TestUnclosedReasoning_VocabEOGIsAnswer(t *testing.T) {
+	sm := Parser{}.NewStateMachine().(*stateMachine)
+	sm.Classify("<ifm|think>")
+	sm.Classify("Sunny.")
+	sm.ConsumeVocabEOG("<|ifm|im_end|>")
+	if got := sm.Flush(); got.Channel != model.ChannelAnswer || got.Content != "Sunny." {
+		t.Errorf("Flush = %+v", got)
+	}
+}
+
+func TestUnclosedReasoning_TruncatedStaysReasoning(t *testing.T) {
+	// No end of turn: generation was cut short (max_tokens).
+	out := drain(t, []string{"<ifm|think>", "Let me", " consider"})
+	if out[model.ChannelReasoning] != "Let me consider" || out[model.ChannelAnswer] != "" {
+		t.Errorf("channels = %#v", out)
+	}
+}
+
+func TestUnclosedReasoning_ToolBlockEndsReasoning(t *testing.T) {
+	for _, opener := range []string{"<ifm|tool_calls>", "<ifm|tool_call>"} {
+		tokens := []string{"<ifm|think>", "Need weather.", opener}
+		if opener == "<ifm|tool_calls>" {
+			tokens = append(tokens, "\n", "<ifm|tool_call>")
+		}
+		tokens = append(tokens, `{"name": "get_weather", "arguments": {"city": "Paris"}}`, "</ifm|tool_call>", "<|ifm|im_end|>")
+
+		out := drain(t, tokens)
+		if out[model.ChannelReasoning] != "Need weather." {
+			t.Errorf("%s: reasoning = %q", opener, out[model.ChannelReasoning])
+		}
+		calls := parseK2(out[model.ChannelTool])
+		if len(calls) != 1 || calls[0].Status != 0 || calls[0].Function.Name != "get_weather" {
+			t.Errorf("%s: tool buffer %q parsed to %+v", opener, out[model.ChannelTool], calls)
 		}
 	}
 }
