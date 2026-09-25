@@ -304,3 +304,31 @@ func TestJSONCallName_Streaming(t *testing.T) {
 		}
 	}
 }
+
+// =============================================================================
+// Params
+// =============================================================================
+
+func TestAdjustParams_ReasoningEffort(t *testing.T) {
+	tests := []struct {
+		in           string
+		wantEffort   string
+		wantThinking string
+	}{
+		{"", "", model.ThinkingEnabled},
+		{"high", "high", model.ThinkingEnabled},
+		{"medium", "medium", model.ThinkingEnabled},
+		{"low", "low", model.ThinkingEnabled},
+		{"minimal", "low", model.ThinkingEnabled},
+		{"none", "", model.ThinkingDisabled},
+		{"xhigh", "high", model.ThinkingEnabled},
+	}
+
+	for _, tt := range tests {
+		got := Parser{}.AdjustParams(model.Params{ReasoningEffort: tt.in, Thinking: model.ThinkingEnabled})
+		if got.ReasoningEffort != tt.wantEffort || got.Thinking != tt.wantThinking {
+			t.Errorf("AdjustParams(%q) = effort %q thinking %q; want %q, %q",
+				tt.in, got.ReasoningEffort, got.Thinking, tt.wantEffort, tt.wantThinking)
+		}
+	}
+}

@@ -90,6 +90,32 @@ func (Parser) ToolCallWithSchema(_ context.Context, _ applog.Logger, buf string,
 	return toolCalls
 }
 
+// AdjustParams coerces reasoning_effort into the values K2-Horizon's chat
+// template accepts: high, medium and low. Any other value makes the
+// template raise and fails the request. "none" turns thinking off (the
+// template then renders an empty reasoning block), "minimal" becomes
+// "low", and anything else unrecognized becomes "high", the model's
+// recommended setting. An empty value remains unset so the template applies
+// its native default (high).
+func (Parser) AdjustParams(params model.Params) model.Params {
+	switch params.ReasoningEffort {
+	case "", model.ReasoningEffortHigh, model.ReasoningEffortMedium, model.ReasoningEffortLow:
+		// Already valid, or left to the template default.
+
+	case model.ReasoningEffortNone:
+		params.Thinking = model.ThinkingDisabled
+		params.ReasoningEffort = ""
+
+	case model.ReasoningEffortMinimal:
+		params.ReasoningEffort = model.ReasoningEffortLow
+
+	default:
+		params.ReasoningEffort = model.ReasoningEffortHigh
+	}
+
+	return params
+}
+
 // containsK2Markers reports whether a chat template carries K2-Horizon's
 // ifm-namespaced reasoning or tool-call tokens.
 func containsK2Markers(template string) bool {
