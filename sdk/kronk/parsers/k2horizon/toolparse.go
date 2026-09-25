@@ -304,12 +304,12 @@ func toolProperties(tools []model.D, name string) model.D {
 // jsonCallName extracts the "name" value from a possibly incomplete JSON
 // call body, reporting false until the whole string value has arrived.
 func jsonCallName(body string) (string, bool) {
-	at := strings.Index(body, jsonNameMarker)
-	if at == -1 {
+	_, after, ok := strings.Cut(body, jsonNameMarker)
+	if !ok {
 		return "", false
 	}
 
-	rest := strings.TrimLeft(body[at+len(jsonNameMarker):], " \t\r\n")
+	rest := strings.TrimLeft(after, " \t\r\n")
 	if !strings.HasPrefix(rest, ":") {
 		return "", false
 	}

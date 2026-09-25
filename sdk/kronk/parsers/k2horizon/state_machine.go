@@ -1,6 +1,7 @@
 package k2horizon
 
 import (
+	"slices"
 	"strings"
 
 	"uuid"
@@ -17,7 +18,7 @@ const (
 )
 
 // reasoningOpeners and reasoningClosers are the effort-specific reasoning
-// tags. Each is a single token in K2-Horizon's vocabulary.
+// tags.
 var (
 	reasoningOpeners = []string{"<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>"}
 	reasoningClosers = []string{"</ifm|think>", "</ifm|think_fast>", "</ifm|think_faster>"}
@@ -29,11 +30,25 @@ var (
 // into content as text.
 var endOfTurn = []string{"<|ifm|im_end|>", "<|ifm|endoftext|>"}
 
+// Markers the scanner looks for, by state. Inside a tool-call block only
+// the block closer and end of turn matter; every other tag there belongs to
+// the call body and is left for parseK2.
+var (
+	outsideToolMarkers = slices.Concat(reasoningOpeners, reasoningClosers, []string{toolCallsOpen, toolCallOpen}, endOfTurn)
+	insideToolMarkers  = slices.Concat([]string{toolCallsClose}, endOfTurn)
+)
+
 // stateMachine is a per-slot streaming state machine for K2-Horizon.
 //
-// Every marker it recognizes is a single vocabulary token, so matching is
-// exact per decoded piece. Inside a tool-call block every piece, markers
-// included, is routed to the tool channel so parseK2 sees the whole block.
+// Every tag is a single token in K2-Horizon's vocabulary, but decoded pieces
+// are not guaranteed to line up with tags, so the state machine scans text
+// rather than matching whole pieces: text that could still become a tag is
+// carried into the next piece, and a piece that crosses channels queues one
+// result per channel. Classify returns the oldest queued result; Flush
+// drains the rest at end of generation.
+//
+// Inside a tool-call block everything but the block's closing tag goes to
+// the tool channel, so parseK2 sees the whole block.
 //
 // Reasoning text is held back until the state machine knows what it is.
 // The chat template opens a reasoning tag in every prompt, but the model
@@ -47,14 +62,13 @@ var endOfTurn = []string{"<|ifm|im_end|>", "<|ifm|endoftext|>"}
 type stateMachine struct {
 	status model.Channel
 
+	carry        string // Text that may be the start of a tag.
 	held         strings.Builder
 	sawEndOfTurn bool
+	queue        []model.Result
 
 	inToolBlock bool
 	toolBuf     strings.Builder
-	// pendingTool is tool-block text not yet returned on the tool channel,
-	// because the piece that produced it returned held reasoning instead.
-	pendingTool string
 
 	toolCallDeltas []model.ResponseToolCallDelta
 	startedCalls   []model.ResponseToolCallDelta
@@ -64,83 +78,137 @@ type stateMachine struct {
 // request.
 func (sm *stateMachine) Reset() {
 	sm.status = model.ChannelAnswer
+	sm.carry = ""
 	sm.held.Reset()
 	sm.sawEndOfTurn = false
+	sm.queue = nil
 	sm.inToolBlock = false
 	sm.toolBuf.Reset()
-	sm.pendingTool = ""
 	sm.toolCallDeltas = nil
 	sm.startedCalls = nil
 }
 
-// Classify classifies a single decoded token's content.
+// Classify classifies a single decoded piece.
 //
 // Behavior is undefined if Classify is called after a previous call returned
 // eog=true. Reset must be invoked between requests.
 func (sm *stateMachine) Classify(content string) (model.Result, bool) {
-	if isOneOf(content, endOfTurn) {
-		sm.sawEndOfTurn = true
-		return model.Result{}, true
+	eog := sm.scan(content)
+
+	if len(sm.queue) > 0 {
+		result := sm.queue[0]
+		sm.queue = sm.queue[1:]
+		return result, eog
 	}
 
-	if sm.inToolBlock {
-		pending := sm.pendingTool
-		sm.pendingTool = ""
+	// Nothing to emit. While reasoning text is held, still report the
+	// reasoning channel so the slot accounts tokens (and skips grammar)
+	// as it would for streamed reasoning.
+	if sm.status == model.ChannelReasoning && !eog {
+		return model.Result{Channel: model.ChannelReasoning}, false
+	}
 
-		if content == toolCallsClose {
-			sm.inToolBlock = false
-			sm.status = model.ChannelAnswer
-			return model.Result{Channel: model.ChannelTool, Content: pending}, false
+	return model.Result{}, eog
+}
+
+// scan consumes text, queuing results, and reports whether the model ended
+// its turn.
+func (sm *stateMachine) scan(content string) bool {
+	text := sm.carry + content
+	sm.carry = ""
+
+	for text != "" {
+		markers := outsideToolMarkers
+		if sm.inToolBlock {
+			markers = insideToolMarkers
 		}
 
-		sm.toolBuf.WriteString(content)
-		sm.updateToolCallDeltas()
-		return model.Result{Channel: model.ChannelTool, Content: pending + content}, false
+		at, marker := firstMarker(text, markers)
+		if at == -1 {
+			keep := partialMarkerSuffix(text, markers)
+			sm.emit(text[:len(text)-keep])
+			sm.carry = text[len(text)-keep:]
+			return false
+		}
+
+		sm.emit(text[:at])
+		text = text[at+len(marker):]
+
+		if slices.Contains(endOfTurn, marker) {
+			sm.sawEndOfTurn = true
+			return true
+		}
+		sm.handleMarker(marker)
+	}
+
+	return false
+}
+
+func (sm *stateMachine) handleMarker(marker string) {
+	switch {
+	case slices.Contains(reasoningOpeners, marker):
+		sm.status = model.ChannelReasoning
+
+	case slices.Contains(reasoningClosers, marker):
+		sm.status = model.ChannelAnswer
+		sm.releaseHeld(model.ChannelReasoning)
+
+	case marker == toolCallsOpen, marker == toolCallOpen:
+		// A tool block ends reasoning just as a closer does. A bare
+		// <ifm|tool_call> is a call without the enclosing wrapper, and
+		// stays in the buffer for parseK2.
+		sm.releaseHeld(model.ChannelReasoning)
+		sm.status = model.ChannelTool
+		sm.inToolBlock = true
+		sm.toolBuf.Reset()
+		if marker == toolCallOpen {
+			sm.emit(marker)
+		}
+
+	case marker == toolCallsClose:
+		sm.inToolBlock = false
+		sm.status = model.ChannelAnswer
+	}
+}
+
+// emit routes text by the current state: tool-block text to the tool
+// channel, reasoning to the held buffer, anything else to the answer.
+func (sm *stateMachine) emit(text string) {
+	if text == "" {
+		return
 	}
 
 	switch {
-	case isOneOf(content, reasoningOpeners):
-		sm.status = model.ChannelReasoning
-		return model.Result{}, false
+	case sm.inToolBlock:
+		sm.toolBuf.WriteString(text)
+		sm.updateToolCallDeltas()
+		sm.enqueue(model.ChannelTool, text)
 
-	case isOneOf(content, reasoningClosers):
-		sm.status = model.ChannelAnswer
-		return sm.releaseHeld(model.ChannelReasoning), false
+	case sm.status == model.ChannelReasoning:
+		sm.held.WriteString(text)
 
-	case content == toolCallsOpen, content == toolCallOpen:
-		// A tool block ends reasoning just as a closer does. A bare
-		// <ifm|tool_call> is a call without the enclosing wrapper.
-		held := sm.releaseHeld(model.ChannelReasoning)
-		opener := ""
-		if content == toolCallOpen {
-			opener = content
-		}
-		sm.startToolBlock(opener)
-		if held.Content != "" {
-			// One result per piece: the held reasoning goes out now and the
-			// opener rides along with the next tool-channel result.
-			sm.pendingTool = opener
-			return held, false
-		}
-		return model.Result{Channel: model.ChannelTool, Content: opener}, false
+	default:
+		sm.enqueue(sm.status, text)
 	}
-
-	if sm.status == model.ChannelReasoning {
-		sm.held.WriteString(content)
-		return model.Result{}, false
-	}
-
-	return model.Result{Channel: sm.status, Content: content}, false
 }
 
-// releaseHeld drains held reasoning text on the given channel.
-func (sm *stateMachine) releaseHeld(channel model.Channel) model.Result {
-	if sm.held.Len() == 0 {
-		return model.Result{}
+// enqueue appends a result, merging it into the previous one when both are
+// on the same channel.
+func (sm *stateMachine) enqueue(channel model.Channel, text string) {
+	if n := len(sm.queue); n > 0 && sm.queue[n-1].Channel == channel {
+		sm.queue[n-1].Content += text
+		return
 	}
-	content := sm.held.String()
+	sm.queue = append(sm.queue, model.Result{Channel: channel, Content: text})
+}
+
+// releaseHeld queues held reasoning text on the given channel.
+func (sm *stateMachine) releaseHeld(channel model.Channel) {
+	if sm.held.Len() == 0 {
+		return
+	}
+	sm.enqueue(channel, sm.held.String())
 	sm.held.Reset()
-	return model.Result{Channel: channel, Content: content}
 }
 
 // ConsumeVocabEOG records that the model ended its turn when the vocabulary
@@ -150,27 +218,31 @@ func (sm *stateMachine) ConsumeVocabEOG(string) {
 	sm.sawEndOfTurn = true
 }
 
-// Flush releases reasoning text still held at end of generation: as the
-// answer if the model ended its turn without closing the reasoning block,
-// otherwise (generation was cut short) as reasoning.
+// Flush drains what is left at end of generation, one result per call:
+// queued results first, then any carried partial tag as ordinary text, then
+// held reasoning (as the answer if the model ended its turn without closing
+// the reasoning block, otherwise as reasoning).
 func (sm *stateMachine) Flush() model.Result {
-	if sm.pendingTool != "" {
-		pending := sm.pendingTool
-		sm.pendingTool = ""
-		return model.Result{Channel: model.ChannelTool, Content: pending}
+	if sm.carry != "" {
+		carry := sm.carry
+		sm.carry = ""
+		sm.emit(carry)
 	}
-	if sm.sawEndOfTurn {
-		return sm.releaseHeld(model.ChannelAnswer)
-	}
-	return sm.releaseHeld(model.ChannelReasoning)
-}
 
-func (sm *stateMachine) startToolBlock(content string) {
-	sm.status = model.ChannelTool
-	sm.inToolBlock = true
-	sm.toolBuf.Reset()
-	sm.toolBuf.WriteString(content)
-	sm.updateToolCallDeltas()
+	if sm.held.Len() > 0 {
+		if sm.sawEndOfTurn {
+			sm.releaseHeld(model.ChannelAnswer)
+		} else {
+			sm.releaseHeld(model.ChannelReasoning)
+		}
+	}
+
+	if len(sm.queue) == 0 {
+		return model.Result{}
+	}
+	result := sm.queue[0]
+	sm.queue = sm.queue[1:]
+	return result
 }
 
 // ToolCallDeltas drains OpenAI-compatible tool-call activity deltas produced
@@ -218,7 +290,7 @@ func streamingCallName(body string) (string, bool) {
 		return jsonCallName(trimmed)
 	}
 
-	// xml / xml_typed: the name runs up to the first newline or marker.
+	// xml / xml_typed: the name runs up to the first newline or tag.
 	end := len(trimmed)
 	complete := false
 	for _, stop := range []string{"\n", argKeyOpen, toolCallClose} {
@@ -235,13 +307,37 @@ func streamingCallName(body string) (string, bool) {
 	return name, name != ""
 }
 
-func isOneOf(content string, markers []string) bool {
+// firstMarker returns the earliest marker in text and its index, or -1.
+// Where two markers start at the same index the longer one wins, so
+// <ifm|think_fast> is not read as <ifm|think> plus text.
+func firstMarker(text string, markers []string) (int, string) {
+	best, found := -1, ""
 	for _, marker := range markers {
-		if content == marker {
-			return true
+		at := strings.Index(text, marker)
+		if at == -1 {
+			continue
+		}
+		if best == -1 || at < best || (at == best && len(marker) > len(found)) {
+			best, found = at, marker
 		}
 	}
-	return false
+	return best, found
+}
+
+// partialMarkerSuffix returns the length of the longest suffix of text that
+// is a proper prefix of one of the markers, i.e. text that may still become
+// a marker once the next piece arrives.
+func partialMarkerSuffix(text string, markers []string) int {
+	longest := 0
+	for _, marker := range markers {
+		for n := min(len(marker)-1, len(text)); n > longest; n-- {
+			if strings.HasSuffix(text, marker[:n]) {
+				longest = n
+				break
+			}
+		}
+	}
+	return longest
 }
 
 func newToolCallID() string {

@@ -103,10 +103,11 @@ func TestStateMachine_ReasoningPrimedByPrompt(t *testing.T) {
 		runSteps(t, effort.open, sm, []step{
 			// The chat template leaves the opener at the end of the prompt;
 			// the batch engine feeds it in before generation starts.
-			{effort.open, model.ChannelNone, "", false},
-			// Reasoning is held until the closer decides what it was.
-			{"The user", model.ChannelNone, "", false},
-			{" wants pong.", model.ChannelNone, "", false},
+			// Reasoning is held until the closer decides what it was; the
+			// channel is still reported so the slot accounts the tokens.
+			{effort.open, model.ChannelReasoning, "", false},
+			{"The user", model.ChannelReasoning, "", false},
+			{" wants pong.", model.ChannelReasoning, "", false},
 			{effort.close, model.ChannelReasoning, "The user wants pong.", false},
 			{"\n", model.ChannelAnswer, "\n", false},
 			{"pong", model.ChannelAnswer, "pong", false},
@@ -405,5 +406,108 @@ func TestUnclosedReasoning_ToolBlockEndsReasoning(t *testing.T) {
 		if len(calls) != 1 || calls[0].Status != 0 || calls[0].Function.Name != "get_weather" {
 			t.Errorf("%s: tool buffer %q parsed to %+v", opener, out[model.ChannelTool], calls)
 		}
+	}
+}
+
+// =============================================================================
+// Fragmented input
+// =============================================================================
+
+// channels feeds pieces through a fresh state machine plus the end-of-
+// generation Flush, returning each channel's accumulated text.
+func channels(pieces []string) map[model.Channel]string {
+	sm := Parser{}.NewStateMachine().(*stateMachine)
+	out := map[model.Channel]string{}
+	for _, piece := range pieces {
+		got, eog := sm.Classify(piece)
+		out[got.Channel] += got.Content
+		if eog {
+			break
+		}
+	}
+	for got := sm.Flush(); got != (model.Result{}); got = sm.Flush() {
+		out[got.Channel] += got.Content
+	}
+	for ch, text := range out {
+		if ch == model.ChannelNone || text == "" {
+			delete(out, ch)
+		}
+	}
+	return out
+}
+
+func splitEvery(s string, n int) []string {
+	var pieces []string
+	for len(s) > n {
+		pieces = append(pieces, s[:n])
+		s = s[n:]
+	}
+	return append(pieces, s)
+}
+
+func TestFragments_EquivalentAcrossBoundaries(t *testing.T) {
+	outputs := map[string]string{
+		"reasoning-then-answer": "<ifm|think>Check a < b.</ifm|think>\nYes, a < b.<|ifm|im_end|>",
+		"medium-effort":         "<ifm|think_fast>quick</ifm|think_fast>\ndone<|ifm|im_end|>",
+		"tool-json": "<ifm|think>Need weather.</ifm|think>\n<ifm|tool_calls>\n" +
+			`<ifm|tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</ifm|tool_call>` +
+			"\n</ifm|tool_calls><|ifm|im_end|>",
+		"tool-xml": "<ifm|think>Search.</ifm|think>\n<ifm|tool_calls>\n<ifm|tool_call>search\n" +
+			"<ifm|arg_key>q</ifm|arg_key>\n<ifm|arg_value>a <b></ifm|arg_value>\n</ifm|tool_call>\n</ifm|tool_calls><|ifm|im_end|>",
+		"unclosed-answer": "<ifm|think>Sunny, 24C.<|ifm|im_end|>",
+	}
+
+	for name, output := range outputs {
+		t.Run(name, func(t *testing.T) {
+			whole := channels([]string{output})
+			for _, n := range []int{1, 2, 3, 5, 7} {
+				got := channels(splitEvery(output, n))
+				if len(got) != len(whole) {
+					t.Fatalf("split %d: channels %#v, whole %#v", n, got, whole)
+				}
+				for ch, text := range whole {
+					if got[ch] != text {
+						t.Errorf("split %d: channel %v = %q, whole = %q", n, ch, got[ch], text)
+					}
+				}
+			}
+
+			if tool := whole[model.ChannelTool]; tool != "" {
+				calls := parseK2(tool)
+				if len(calls) != 1 || calls[0].Status != 0 {
+					t.Errorf("tool buffer %q parsed to %+v", tool, calls)
+				}
+			}
+		})
+	}
+}
+
+func TestFragments_Expected(t *testing.T) {
+	got := channels(splitEvery("<ifm|think>Check a < b.</ifm|think>\nYes, a < b.<|ifm|im_end|>", 3))
+	if got[model.ChannelReasoning] != "Check a < b." || got[model.ChannelAnswer] != "\nYes, a < b." {
+		t.Errorf("channels = %#v", got)
+	}
+
+	got = channels(splitEvery("<ifm|think>Sunny, 24C.<|ifm|im_end|>", 4))
+	if got[model.ChannelAnswer] != "Sunny, 24C." || got[model.ChannelReasoning] != "" {
+		t.Errorf("unclosed channels = %#v", got)
+	}
+}
+
+func TestFragments_SeveralTagsInOnePiece(t *testing.T) {
+	sm := Parser{}.NewStateMachine()
+	runSteps(t, "one-piece", sm, []step{
+		{"<ifm|think>plan</ifm|think>\nanswer", model.ChannelReasoning, "plan", false},
+	})
+	if got := sm.(*stateMachine).Flush(); got.Channel != model.ChannelAnswer || got.Content != "\nanswer" {
+		t.Errorf("Flush = %+v, want the answer queued behind the reasoning", got)
+	}
+}
+
+func TestFragments_PartialTagAtEnd(t *testing.T) {
+	// A trailing "<ifm|th" never became a tag: it is ordinary answer text.
+	got := channels([]string{"x < y and <ifm|th"})
+	if got[model.ChannelAnswer] != "x < y and <ifm|th" {
+		t.Errorf("channels = %#v", got)
 	}
 }
