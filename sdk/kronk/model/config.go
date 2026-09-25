@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -51,6 +52,7 @@ const (
 const (
 	defContextWindow        = 8 * 1024
 	defMinCacheTokens       = 100
+	defNThreads             = 4
 	defNSeqMax              = 1
 	defNDraft               = 5
 	defaultAdmissionTimeout = 3 * time.Minute
@@ -257,10 +259,10 @@ type AdapterConfig struct {
 // default of 1 is used.
 //
 // NThreads is the number of threads to use for generation. When unset or set
-// to 0, it defaults to Yzma's hardware-aware CPU thread count.
+// to 0, it defaults to the greater of 4 and runtime.NumCPU().
 //
 // NThreadsBatch is the number of threads to use for batch processing. When
-// unset or set to 0, it defaults to Yzma's hardware-aware CPU thread count.
+// unset or set to 0, it defaults to the greater of 4 and runtime.NumCPU().
 //
 // NUMA controls the NUMA (Non-Uniform Memory Access) strategy. This matters
 // most when expert tensors are on CPU and the system has multiple NUMA nodes.
@@ -818,7 +820,7 @@ func adjustConfig(cfg Config, model llama.Model) Config {
 		cfg = adjustGenerationBatch(cfg, 1, false)
 	}
 
-	nThreads := int(llama.Threads())
+	nThreads := max(defNThreads, runtime.NumCPU())
 	if cfg.NThreads() <= 0 {
 		cfg.PtrNThreads = new(nThreads)
 	}
@@ -954,8 +956,12 @@ func modelCtxParams(cfg Config, mi ModelInfo) llama.ContextParams {
 	if cfg.ContextWindow() > 0 {
 		ctxParams.NBatch = uint32(cfg.EffectiveNBatch())
 		ctxParams.NUbatch = uint32(cfg.EffectiveNUBatch())
-		ctxParams.NThreads = int32(cfg.NThreads())
-		ctxParams.NThreadsBatch = int32(cfg.NThreadsBatch())
+		if cfg.NThreads() > 0 {
+			ctxParams.NThreads = int32(cfg.NThreads())
+		}
+		if cfg.NThreadsBatch() > 0 {
+			ctxParams.NThreadsBatch = int32(cfg.NThreadsBatch())
+		}
 	}
 
 	if cfg.CacheTypeK != GGMLTypeAuto {
