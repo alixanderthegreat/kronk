@@ -1,0 +1,306 @@
+package k2horizon
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/ardanlabs/kronk/sdk/kronk/model"
+)
+
+type step struct {
+	token   string
+	channel model.Channel
+	content string
+	eog     bool
+}
+
+func runSteps(t *testing.T, name string, c model.StateMachine, steps []step) {
+	t.Helper()
+	for i, s := range steps {
+		got, eog := c.Classify(s.token)
+		if got.Channel != s.channel {
+			t.Errorf("%s step %d (%q): channel = %v, want %v",
+				name, i, s.token, got.Channel, s.channel)
+		}
+		if got.Content != s.content {
+			t.Errorf("%s step %d (%q): content = %q, want %q",
+				name, i, s.token, got.Content, s.content)
+		}
+		if eog != s.eog {
+			t.Errorf("%s step %d (%q): eog = %v, want %v",
+				name, i, s.token, eog, s.eog)
+		}
+	}
+}
+
+// toolBuffer feeds tokens through a fresh state machine and returns what
+// the batch engine would accumulate into its tool-call buffer.
+func toolBuffer(t *testing.T, tokens []string) (string, *stateMachine) {
+	t.Helper()
+	sm := Parser{}.NewStateMachine().(*stateMachine)
+	var buf strings.Builder
+	for _, token := range tokens {
+		got, eog := sm.Classify(token)
+		if eog {
+			break
+		}
+		if got.Channel == model.ChannelTool {
+			buf.WriteString(got.Content)
+		}
+	}
+	return buf.String(), sm
+}
+
+// =============================================================================
+// Parser selection
+// =============================================================================
+
+func TestNew_ClaimsK2Horizon(t *testing.T) {
+	tests := []struct {
+		name string
+		fp   model.Fingerprint
+		want bool
+	}{
+		{"arch", model.Fingerprint{Architecture: "k2-horizon"}, true},
+		{"arch-underscore", model.Fingerprint{Architecture: "k2_horizon"}, true},
+		{"arch-mixed-case", model.Fingerprint{Architecture: "K2-Horizon"}, true},
+		{"template-tool-call", model.Fingerprint{ChatTemplate: "<ifm|tool_calls>\n<ifm|tool_call>"}, true},
+		{"template-think", model.Fingerprint{ChatTemplate: "<|ifm|im_start|>assistant\n<ifm|think>\n"}, true},
+		{"name", model.Fingerprint{ModelName: "K2-Horizon-MoVA-36B-A4B"}, true},
+
+		{"qwen", model.Fingerprint{Architecture: "qwen3", ChatTemplate: "<think>\n<tool_call>", ModelName: "Qwen3-8B"}, false},
+		{"glm-markers", model.Fingerprint{ChatTemplate: "<tool_call>f<arg_key>k</arg_key><arg_value>v</arg_value>"}, false},
+		{"empty", model.Fingerprint{}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, got := New(tt.fp); got != tt.want {
+				t.Errorf("New(%+v) claimed = %v, want %v", tt.fp, got, tt.want)
+			}
+		})
+	}
+}
+
+// =============================================================================
+// Reasoning and end of turn
+// =============================================================================
+
+func TestStateMachine_ReasoningPrimedByPrompt(t *testing.T) {
+	for _, effort := range []struct{ open, close string }{
+		{"<ifm|think>", "</ifm|think>"},
+		{"<ifm|think_fast>", "</ifm|think_fast>"},
+		{"<ifm|think_faster>", "</ifm|think_faster>"},
+	} {
+		sm := Parser{}.NewStateMachine()
+		runSteps(t, effort.open, sm, []step{
+			// The chat template leaves the opener at the end of the prompt;
+			// the batch engine feeds it in before generation starts.
+			{effort.open, model.ChannelNone, "", false},
+			{"The user", model.ChannelReasoning, "The user", false},
+			{" wants pong.", model.ChannelReasoning, " wants pong.", false},
+			{effort.close, model.ChannelNone, "", false},
+			{"\n", model.ChannelAnswer, "\n", false},
+			{"pong", model.ChannelAnswer, "pong", false},
+			{"<|ifm|im_end|>", model.ChannelNone, "", true},
+		})
+	}
+}
+
+func TestStateMachine_ThinkingDisabled(t *testing.T) {
+	// enable_thinking=false renders an empty <ifm|think></ifm|think> in the
+	// prompt, so generation starts directly in the answer.
+	runSteps(t, "no-think", Parser{}.NewStateMachine(), []step{
+		{"pong", model.ChannelAnswer, "pong", false},
+		{"<|ifm|endoftext|>", model.ChannelNone, "", true},
+	})
+}
+
+func TestStateMachine_Reset(t *testing.T) {
+	sm := Parser{}.NewStateMachine()
+	sm.Classify("<ifm|think>")
+	sm.Classify("<ifm|tool_calls>")
+	sm.Reset()
+	runSteps(t, "after-reset", sm, []step{
+		{"hello", model.ChannelAnswer, "hello", false},
+	})
+}
+
+// =============================================================================
+// Tool calls
+// =============================================================================
+
+func TestToolCall_JSON(t *testing.T) {
+	buf, sm := toolBuffer(t, []string{
+		"<ifm|think>", "Check the weather.", "</ifm|think>", "\n",
+		"<ifm|tool_calls>", "\n",
+		"<ifm|tool_call>", `{"name": "get_weather", `, `"arguments": {"city": "Paris", "days": 3}}`, "</ifm|tool_call>", "\n",
+		"<ifm|tool_call>", `{"name": "get_time", "arguments": {}}`, "</ifm|tool_call>", "\n",
+		"</ifm|tool_calls>",
+		"<|ifm|im_end|>",
+	})
+
+	calls := Parser{}.ToolCall(context.Background(), nil, buf)
+	if len(calls) != 2 {
+		t.Fatalf("got %d calls, want 2: %+v", len(calls), calls)
+	}
+	if calls[0].Function.Name != "get_weather" || calls[1].Function.Name != "get_time" {
+		t.Errorf("names = %q, %q", calls[0].Function.Name, calls[1].Function.Name)
+	}
+	if got := calls[0].Function.Arguments["city"]; got != "Paris" {
+		t.Errorf("city = %#v, want Paris", got)
+	}
+	if got := calls[0].Function.Arguments["days"]; got != json.Number("3") {
+		t.Errorf("days = %#v, want json.Number 3", got)
+	}
+	if len(calls[1].Function.Arguments) != 0 {
+		t.Errorf("get_time arguments = %#v, want empty", calls[1].Function.Arguments)
+	}
+
+	started := sm.StartedToolCalls()
+	if len(started) != 2 || started[0].Function.Name != "get_weather" || started[1].Index != 1 {
+		t.Errorf("started deltas = %+v", started)
+	}
+}
+
+func TestToolCall_JSONStringArguments(t *testing.T) {
+	buf := `<ifm|tool_call>{"name": "f", "arguments": "{\"a\": 1}"}</ifm|tool_call>`
+	calls := parseK2(buf)
+	if len(calls) != 1 || calls[0].Status != 0 || calls[0].Function.Arguments["a"] != json.Number("1") {
+		t.Errorf("calls = %+v", calls)
+	}
+}
+
+func TestToolCall_XMLWithSchema(t *testing.T) {
+	buf, sm := toolBuffer(t, []string{
+		"<ifm|tool_calls>", "\n",
+		"<ifm|tool_call>", "search", "\n",
+		"<ifm|arg_key>", "query", "</ifm|arg_key>", "\n",
+		"<ifm|arg_value>", "go 1.27 release", "</ifm|arg_value>", "\n",
+		"<ifm|arg_key>", "limit", "</ifm|arg_key>", "\n",
+		"<ifm|arg_value>", "5", "</ifm|arg_value>", "\n",
+		"<ifm|arg_key>", "fresh", "</ifm|arg_key>", "\n",
+		"<ifm|arg_value>", "true", "</ifm|arg_value>", "\n",
+		"<ifm|arg_key>", "sites", "</ifm|arg_key>", "\n",
+		"<ifm|arg_value>", `["go.dev"]`, "</ifm|arg_value>", "\n",
+		"</ifm|tool_call>", "\n",
+		"</ifm|tool_calls>",
+	})
+
+	tools := []model.D{{
+		"type": "function",
+		"function": model.D{
+			"name": "search",
+			"parameters": model.D{
+				"type": "object",
+				"properties": model.D{
+					"query": model.D{"type": "string"},
+					"limit": model.D{"type": "integer"},
+					"fresh": model.D{"type": "boolean"},
+					"sites": model.D{"type": "array"},
+				},
+			},
+		},
+	}}
+
+	calls := Parser{}.ToolCallWithSchema(context.Background(), nil, buf, tools)
+	if len(calls) != 1 || calls[0].Status != 0 {
+		t.Fatalf("calls = %+v", calls)
+	}
+	args := calls[0].Function.Arguments
+	if args["query"] != "go 1.27 release" {
+		t.Errorf("query = %#v", args["query"])
+	}
+	if args["limit"] != json.Number("5") {
+		t.Errorf("limit = %#v, want json.Number 5", args["limit"])
+	}
+	if args["fresh"] != true {
+		t.Errorf("fresh = %#v, want true", args["fresh"])
+	}
+	if sites, ok := args["sites"].([]any); !ok || len(sites) != 1 || sites[0] != "go.dev" {
+		t.Errorf("sites = %#v", args["sites"])
+	}
+
+	if started := sm.StartedToolCalls(); len(started) != 1 || started[0].Function.Name != "search" {
+		t.Errorf("started deltas = %+v", started)
+	}
+}
+
+func TestToolCall_XMLTyped(t *testing.T) {
+	buf := "<ifm|tool_call>set\n" +
+		"<ifm|arg_key>n</ifm|arg_key>\n<ifm|arg_type>integer</ifm|arg_type>\n<ifm|arg_value>42</ifm|arg_value>\n" +
+		"<ifm|arg_key>label</ifm|arg_key>\n<ifm|arg_type>string</ifm|arg_type>\n<ifm|arg_value>007</ifm|arg_value>\n" +
+		"</ifm|tool_call>"
+
+	calls := parseK2(buf)
+	if len(calls) != 1 || calls[0].Status != 0 {
+		t.Fatalf("calls = %+v", calls)
+	}
+	if got := calls[0].Function.Arguments["n"]; got != json.Number("42") {
+		t.Errorf("n = %#v, want json.Number 42", got)
+	}
+	if got := calls[0].Function.Arguments["label"]; got != "007" {
+		t.Errorf("label = %#v, want the string 007", got)
+	}
+}
+
+func TestToolCall_BareCallWithoutWrapper(t *testing.T) {
+	buf, _ := toolBuffer(t, []string{
+		"<ifm|tool_call>", `{"name": "ping", "arguments": {}}`, "</ifm|tool_call>",
+		"<|ifm|im_end|>",
+	})
+	calls := parseK2(buf)
+	if len(calls) != 1 || calls[0].Function.Name != "ping" {
+		t.Errorf("calls = %+v", calls)
+	}
+}
+
+func TestToolCall_Unterminated(t *testing.T) {
+	calls := parseK2("\n<ifm|tool_call>ping\n<ifm|arg_key>host</ifm|arg_key>\n<ifm|arg_value>core</ifm|arg_value>\n")
+	if len(calls) != 1 || calls[0].Status != 0 || calls[0].Function.Arguments["host"] != "core" {
+		t.Errorf("calls = %+v", calls)
+	}
+}
+
+func TestToolCall_Malformed(t *testing.T) {
+	tests := []struct {
+		name string
+		buf  string
+	}{
+		{"no-calls", "\n"},
+		{"bad-json", `<ifm|tool_call>{"name": "f", "arguments": {</ifm|tool_call>`},
+		{"empty-name", "<ifm|tool_call>\n<ifm|arg_key>k</ifm|arg_key><ifm|arg_value>v</ifm|arg_value></ifm|tool_call>"},
+		{"unclosed-value", "<ifm|tool_call>f\n<ifm|arg_key>k</ifm|arg_key><ifm|arg_value>v</ifm|tool_call>"},
+		{"duplicate-key", "<ifm|tool_call>f<ifm|arg_key>k</ifm|arg_key><ifm|arg_value>1</ifm|arg_value><ifm|arg_key>k</ifm|arg_key><ifm|arg_value>2</ifm|arg_value></ifm|tool_call>"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := parseK2(tt.buf)
+			if len(calls) != 1 || calls[0].Status != 2 || calls[0].Error == "" {
+				t.Errorf("calls = %+v, want one failed call", calls)
+			}
+		})
+	}
+}
+
+func TestJSONCallName_Streaming(t *testing.T) {
+	tests := []struct {
+		body string
+		want string
+		ok   bool
+	}{
+		{`{"na`, "", false},
+		{`{"name": "get_wea`, "", false},
+		{`{"name": "get_weather"`, "get_weather", true},
+		{`{"name":"a\"b"`, `a"b`, true},
+	}
+	for _, tt := range tests {
+		got, ok := jsonCallName(tt.body)
+		if got != tt.want || ok != tt.ok {
+			t.Errorf("jsonCallName(%q) = %q, %v; want %q, %v", tt.body, got, ok, tt.want, tt.ok)
+		}
+	}
+}

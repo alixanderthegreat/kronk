@@ -40,7 +40,8 @@ func (e *batchEngine) startSlot(s *slot, job *chatJob, buf []byte) {
 	// sampling is skipped during the thinking phase.
 	//
 	// Templates differ in their opener and trailing whitespace: Kimi uses
-	// <|open|>think<|sep|>, while templates using <think> may add whitespace.
+	// <|open|>think<|sep|>, K2-Horizon uses one of three effort-specific
+	// <ifm|think…> openers, while templates using <think> may add whitespace.
 	// Qwen emits exactly "<think>\n", Nemotron emits "<think>\n\n", and
 	// some custom templates may emit "<think>" with no newline. Accept
 	// any of these by trimming trailing ASCII whitespace before checking.
@@ -49,19 +50,14 @@ func (e *batchEngine) startSlot(s *slot, job *chatJob, buf []byte) {
 	// the output format, so free-form thinking is counterproductive and
 	// would consume max_tokens before producing any constrained content.
 	trimmedPrompt := strings.TrimRight(job.prompt, " \t\r\n")
-	if (strings.HasSuffix(trimmedPrompt, "<think>") ||
-		strings.HasSuffix(trimmedPrompt, "<|open|>think<|sep|>")) && job.params.Grammar == "" {
+	if marker, ok := promptReasoningOpener(trimmedPrompt); ok && job.params.Grammar == "" {
 		// Drive the state machine into reasoning mode by feeding the same
 		// marker the model would have emitted. Parsers that recognize
 		// <think> (fallback, qwen, mistral, glm) flip to ChannelReasoning;
-		// Kimi recognizes its <|open|>think<|sep|> marker. Parsers that don't
+		// Kimi and K2-Horizon recognize their own markers. Parsers that don't
 		// (gemma, gpt) treat the marker as content — but
 		// those parsers do not produce a "<think>\n" suffix in the
 		// prompt, so this branch never runs for them.
-		marker := "<think>"
-		if strings.HasSuffix(trimmedPrompt, "<|open|>think<|sep|>") {
-			marker = "<|open|>think<|sep|>"
-		}
 		s.stateMachine.Classify(marker)
 		s.reasonFlag = 1
 	}
@@ -1459,4 +1455,26 @@ func primeSamplerWith(sampler llama.Sampler, tokens []llama.Token, required bool
 			accept(sampler, token)
 		}
 	}
+}
+
+// promptReasoningOpeners are the reasoning openers a chat template may leave
+// open at the end of a rendered prompt. The longer K2-Horizon openers come
+// before plain <think>, which none of them end with.
+var promptReasoningOpeners = []string{
+	"<|open|>think<|sep|>",
+	"<ifm|think_faster>",
+	"<ifm|think_fast>",
+	"<ifm|think>",
+	"<think>",
+}
+
+// promptReasoningOpener reports the reasoning opener a trimmed prompt ends
+// with, if any.
+func promptReasoningOpener(trimmedPrompt string) (string, bool) {
+	for _, marker := range promptReasoningOpeners {
+		if strings.HasSuffix(trimmedPrompt, marker) {
+			return marker, true
+		}
+	}
+	return "", false
 }

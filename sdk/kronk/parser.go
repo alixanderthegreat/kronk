@@ -9,6 +9,7 @@ import (
 	"github.com/ardanlabs/kronk/sdk/kronk/parsers/gemma"
 	"github.com/ardanlabs/kronk/sdk/kronk/parsers/glm"
 	"github.com/ardanlabs/kronk/sdk/kronk/parsers/gpt"
+	"github.com/ardanlabs/kronk/sdk/kronk/parsers/k2horizon"
 	"github.com/ardanlabs/kronk/sdk/kronk/parsers/kimi"
 	"github.com/ardanlabs/kronk/sdk/kronk/parsers/lfm"
 	"github.com/ardanlabs/kronk/sdk/kronk/parsers/llama"
@@ -50,6 +51,7 @@ func registerDefaultParsers() {
 		model.RegisterParser(gpt.New) // template-only — must be first
 		model.RegisterParser(lfm.New)
 		model.RegisterParser(kimi.New)
+		model.RegisterParser(k2horizon.New)
 		model.RegisterParser(deepseek.New)
 		model.RegisterParser(llama.New)
 		model.RegisterParser(qwen.New)
