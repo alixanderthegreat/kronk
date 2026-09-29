@@ -201,3 +201,32 @@ func dMessages(d D) []D {
 	messages, _ := d["messages"].([]D)
 	return messages
 }
+
+// imcSystemProbeContent is the placeholder user message rendered after the
+// system messages when a template can't render them alone (see
+// prepareCacheAndPrompt). Its text never reaches the model.
+const imcSystemProbeContent = "."
+
+// imcSystemBoundary returns how many leading tokens of stable are the system
+// part, given probe: the same system messages rendered with a placeholder user
+// message. The two share the system turn and the opening of the user turn,
+// then differ at the user's content. The shared prefix alone isn't a stable
+// cut: whether the newline after the user role merges with the first word of
+// the content varies with that word, so the same system prompt would get
+// different boundaries on different requests and never match its own cache.
+// Backing off to just after the last control token in the shared prefix (the
+// user turn's start marker) gives the same cut for every request. Returns 0
+// when there is no such cut, or when it would cover all of stable.
+func imcSystemBoundary(stable, probe []llama.Token, isControl func(llama.Token) bool) int {
+	n := 0
+	for n < len(stable) && n < len(probe) && stable[n] == probe[n] {
+		n++
+	}
+	for n > 0 && !isControl(stable[n-1]) {
+		n--
+	}
+	if n >= len(stable) {
+		return 0
+	}
+	return n
+}
