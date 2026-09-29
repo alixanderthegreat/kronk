@@ -453,7 +453,26 @@ func (m *Model) prepareCacheAndPrompt(ctx context.Context, d D, object string, r
 						m.log(ctx, "imc", "status", "system-cache-skipped", "reason", "render-not-prefix-compatible")
 					}
 				} else {
-					m.log(ctx, "imc", "status", "system-cache-skipped", "reason", "render-failed", "err", systemErr)
+					// Some templates (Qwen3.5/3.8) refuse to render system
+					// messages alone ("No user query found in messages"), which
+					// left the System tier unusable for them. Probe instead:
+					// render the system messages followed by a placeholder user
+					// message and take the boundary from what that shares with
+					// the real prompt.
+					probeD := maps.Clone(stableD)
+					probeD["messages"] = append(slices.Clone(messages[:systemMessages]), D{"role": "user", "content": imcSystemProbeContent})
+					probePrompt, _, probeErr := m.createPrompt(ctx, probeD)
+					if probeErr != nil {
+						m.log(ctx, "imc", "status", "system-cache-skipped", "reason", "render-failed", "err", systemErr, "probe_err", probeErr)
+					} else {
+						probe := llama.Tokenize(m.vocab, probePrompt, m.addBOSToken, true)
+						isControl := func(t llama.Token) bool { return llama.VocabIsControl(m.vocab, t) }
+						if boundary := imcSystemBoundary(stableTokens, probe, isControl); boundary > 0 {
+							systemTokens = stableTokens[:boundary]
+						} else {
+							m.log(ctx, "imc", "status", "system-cache-skipped", "reason", "probe-no-boundary")
+						}
+					}
 				}
 			}
 
